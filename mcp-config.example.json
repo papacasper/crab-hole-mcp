@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "crab-hole": {
+      "command": "crab-hole-mcp",
+      "env": {
+        "CRAB_HOLE_SSH_HOST": "your-server-ip-or-hostname",
+        "CRAB_HOLE_SSH_USER": "ubuntu"
+      }
+    }
+  }
+}

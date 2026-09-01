@@ -1,0 +1,42 @@
+{
+  "name": "crab-hole-mcp",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "MCP server for inspecting and administering a Crab-hole DNS filter over SSH",
+  "license": "MIT",
+  "keywords": ["mcp", "model-context-protocol", "crab-hole", "dns", "pi-hole", "self-hosted"],
+  "bin": {
+    "crab-hole-mcp": "bin/crab-hole-mcp"
+  },
+  "files": [
+    "bin",
+    "dist",
+    "remote",
+    "mcp-config.example.json",
+    ".env.example",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/src/index.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "smoke:mcp": "node dist/src/mcp-smoke.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "dotenv": "17.4.2",
+    "zod": "3.25.76"
+  },
+  "overrides": {
+    "@hono/node-server": "2.0.11"
+  },
+  "devDependencies": {
+    "@types/node": "24.0.15",
+    "tsx": "4.20.3",
+    "typescript": "5.8.3",
+    "vitest": "3.2.6"
+  }
+}

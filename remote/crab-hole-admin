@@ -1,0 +1,330 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+readonly CONFIG_FILE="/etc/crab-hole/config.toml"
+readonly ALLOW_FILE="/etc/crab-hole/allowed-custom.txt"
+readonly BLOCK_FILE="/etc/crab-hole/blocked-custom.txt"
+readonly BACKUP_DIR="/var/backups/crab-hole-mcp"
+readonly LOCK_FILE="/run/lock/crab-hole-admin.lock"
+readonly SERVICE="crab-hole.service"
+readonly CRAB_HOLE_BIN="/usr/local/bin/crab-hole"
+readonly MAX_CONFIG_BYTES=49152
+
+die() {
+  printf '{"error":%s}\n' "$(jq -Rn --arg value "$*" '$value')"
+  exit 1
+}
+
+normalize_domain() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed 's/\.$//'
+}
+
+validate_domain() {
+  local kind="$1" domain="$2" bare label
+  [[ ${#domain} -le 253 ]] || die "Domain is too long"
+  [[ "$domain" != *..* ]] || die "Domain contains an empty label"
+  if [[ "$domain" == \*.* ]]; then
+    [[ "$kind" == "allow" ]] || die "Wildcard block rules are not supported"
+    bare="${domain#*.}"
+  else
+    bare="$domain"
+  fi
+  [[ "$bare" == *.* ]] || die "Domain must contain at least two labels"
+  [[ "$bare" =~ ^[a-z0-9.-]+$ ]] || die "Domain contains invalid characters"
+  IFS='.' read -r -a labels <<< "$bare"
+  for label in "${labels[@]}"; do
+    [[ -n "$label" && ${#label} -le 63 ]] || die "Invalid domain label length"
+    [[ "$label" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ ]] || die "Invalid domain label"
+  done
+}
+
+rule_file() {
+  case "$1" in
+    allow) printf '%s\n' "$ALLOW_FILE" ;;
+    block) printf '%s\n' "$BLOCK_FILE" ;;
+    *) die "Rule kind must be allow or block" ;;
+  esac
+}
+
+wait_ready() {
+  local i
+  for i in {1..60}; do
+    if systemctl is-active --quiet "$SERVICE" && ss -lnup | grep -q '127.0.0.1:5354'; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+restart_service() {
+  systemctl restart "$SERVICE"
+  wait_ready || die "Crab-hole did not become ready after restart"
+}
+
+config_sha() {
+  sha256sum "$CONFIG_FILE" | awk '{print $1}'
+}
+
+backup_file() {
+  local file="$1" timestamp backup
+  install -d -o root -g root -m 0750 "$BACKUP_DIR"
+  timestamp="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  backup="$BACKUP_DIR/$(basename "$file").$timestamp"
+  cp --preserve=mode,ownership,timestamps "$file" "$backup"
+  printf '%s\n' "$backup"
+}
+
+validate_config_file() {
+  local candidate="$1" staging rc
+  staging="$(mktemp -d /tmp/crab-hole-validate.XXXXXX)"
+  install -m 0640 "$candidate" "$staging/config.toml"
+  if CRAB_HOLE_DIR="$staging" "$CRAB_HOLE_BIN" validate-config >/dev/null 2>&1; then rc=0; else rc=$?; fi
+  rm -rf -- "$staging"
+  return "$rc"
+}
+
+decode_config() {
+  local encoded="$1" destination="$2" size
+  printf '%s' "$encoded" | base64 --decode > "$destination" 2>/dev/null || die "Configuration is not valid base64"
+  size="$(stat -c %s "$destination")"
+  [[ "$size" -ge 1 && "$size" -le "$MAX_CONFIG_BYTES" ]] || die "Configuration must be between 1 and $MAX_CONFIG_BYTES bytes"
+}
+
+status() {
+  local crab_state version block_count last_refresh
+  local memory_current memory_peak restarts allow_count block_count_custom
+  crab_state="$(systemctl is-active "$SERVICE" 2>/dev/null || true)"
+  version="$(/usr/local/bin/crab-hole --version 2>&1 | tail -n 1 | awk '{print $NF}')"
+  block_count="$(journalctl -u "$SERVICE" --no-pager -o cat | sed -n 's/.*> \([0-9,]*\) domains are blocked/\1/p' | tail -n 1 | tr -d ',')"
+  last_refresh="$(journalctl -u "$SERVICE" --no-pager -o short-iso | grep 'finish updating blocklist' | tail -n 1 | awk '{print $1}')"
+  memory_current="$(systemctl show "$SERVICE" -p MemoryCurrent --value)"
+  memory_peak="$(systemctl show "$SERVICE" -p MemoryPeak --value)"
+  restarts="$(systemctl show "$SERVICE" -p NRestarts --value)"
+  allow_count="$(wc -l < "$ALLOW_FILE")"
+  block_count_custom="$(wc -l < "$BLOCK_FILE")"
+  jq -n \
+    --arg crabHole "$crab_state" \
+    --arg version "$version" \
+    --arg lastRefresh "$last_refresh" \
+    --argjson blockedDomains "${block_count:-0}" \
+    --argjson memoryCurrent "${memory_current:-0}" \
+    --argjson memoryPeak "${memory_peak:-0}" \
+    --argjson restarts "${restarts:-0}" \
+    --argjson customAllows "$allow_count" \
+    --argjson customBlocks "$block_count_custom" \
+    '{services:{crabHole:$crabHole},version:$version,blockedDomains:$blockedDomains,lastRefresh:$lastRefresh,memoryBytes:{current:$memoryCurrent,peak:$memoryPeak},restarts:$restarts,rules:{customAllows:$customAllows,customBlocks:$block_count_custom}}'
+}
+
+get_config() {
+  local sha content
+  sha="$(config_sha)"
+  content="$(base64 -w0 "$CONFIG_FILE")"
+  jq -n --arg sha256 "$sha" --arg encoding "base64" --arg content "$content" \
+    '{sha256:$sha256,encoding:$encoding,content:$content}'
+}
+
+validate_current() {
+  local config_valid=false lists_valid=false config_output lists_output
+  if config_output="$(CRAB_HOLE_DIR=/etc/crab-hole "$CRAB_HOLE_BIN" validate-config 2>&1)"; then config_valid=true; fi
+  if lists_output="$(CRAB_HOLE_DIR=/etc/crab-hole "$CRAB_HOLE_BIN" validate-lists 2>&1)"; then lists_valid=true; fi
+  jq -n --argjson configValid "$config_valid" --argjson listsValid "$lists_valid" \
+    --arg configSummary "$(tail -n 5 <<< "$config_output")" --arg listsSummary "$(tail -n 5 <<< "$lists_output")" \
+    '{configValid:$configValid,listsValid:$listsValid,configSummary:$configSummary,listsSummary:$listsSummary}'
+}
+
+validate_proposed() {
+  local encoded="$1" temp valid=false summary="Configuration validation failed"
+  temp="$(mktemp /tmp/crab-hole-config.XXXXXX)"
+  trap 'rm -f -- "$temp"' EXIT
+  decode_config "$encoded" "$temp"
+  if validate_config_file "$temp"; then valid=true; summary="Configuration is valid"; fi
+  rm -f -- "$temp"
+  trap - EXIT
+  jq -n --argjson valid "$valid" --arg summary "$(tail -n 10 <<< "$summary")" '{valid:$valid,summary:$summary}'
+}
+
+replace_config() {
+  local encoded="$1" expected_sha="$2" apply_now="$3" current_sha temp backup new_sha
+  [[ "$expected_sha" =~ ^[a-f0-9]{64}$ ]] || die "expectedSha256 must be a lowercase SHA-256 digest"
+  [[ "$apply_now" == "true" || "$apply_now" == "false" ]] || die "applyNow must be true or false"
+  exec 9>"$LOCK_FILE"
+  flock -x 9
+  current_sha="$(config_sha)"
+  [[ "$current_sha" == "$expected_sha" ]] || die "Configuration changed since it was read; fetch it again before replacing"
+  temp="$(mktemp /tmp/crab-hole-config.XXXXXX)"
+  trap 'rm -f -- "$temp"' EXIT
+  decode_config "$encoded" "$temp"
+  validate_config_file "$temp" || die "Proposed Crab-hole configuration failed validation"
+  backup="$(backup_file "$CONFIG_FILE")"
+  install -o root -g crabhole -m 0640 "$temp" "$CONFIG_FILE"
+  new_sha="$(config_sha)"
+  if [[ "$apply_now" == "true" ]]; then
+    if ! systemctl restart "$SERVICE" || ! wait_ready; then
+      cp --preserve=mode,ownership,timestamps "$backup" "$CONFIG_FILE"
+      systemctl restart "$SERVICE" || true
+      wait_ready || true
+      die "Configuration replacement was rolled back because Crab-hole did not become ready"
+    fi
+  fi
+  rm -f -- "$temp"
+  trap - EXIT
+  jq -n --arg previousSha256 "$current_sha" --arg sha256 "$new_sha" --arg backup "$backup" \
+    --argjson appliedNow "$apply_now" '{changed:($previousSha256 != $sha256),previousSha256:$previousSha256,sha256:$sha256,appliedNow:$appliedNow,backup:$backup}'
+}
+
+list_backups() {
+  local limit="$1" entries
+  [[ "$limit" =~ ^[0-9]+$ && "$limit" -ge 1 && "$limit" -le 200 ]] || die "Invalid backup limit"
+  install -d -o root -g root -m 0750 "$BACKUP_DIR"
+  entries="$(find "$BACKUP_DIR" -maxdepth 1 -type f -printf '%f\t%s\t%TY-%Tm-%TdT%TH:%TM:%TSZ\n' | sort -r | head -n "$limit" | jq -Rsc 'split("\n") | map(select(length > 0) | split("\t") | {id:.[0],bytes:(.[1]|tonumber),modified:.[2]})')"
+  jq -n --argjson entries "$entries" '{entries:$entries}'
+}
+
+restore_config() {
+  local backup_id="$1" apply_now="$2" source current_backup restored_sha
+  [[ "$backup_id" =~ ^config\.toml\.[A-Za-z0-9._-]+$ ]] || die "Invalid configuration backup id"
+  [[ "$apply_now" == "true" || "$apply_now" == "false" ]] || die "applyNow must be true or false"
+  source="$BACKUP_DIR/$backup_id"
+  [[ -f "$source" ]] || die "Configuration backup does not exist"
+  exec 9>"$LOCK_FILE"
+  flock -x 9
+  validate_config_file "$source" || die "Selected backup is not a valid Crab-hole configuration"
+  current_backup="$(backup_file "$CONFIG_FILE")"
+  install -o root -g crabhole -m 0640 "$source" "$CONFIG_FILE"
+  if [[ "$apply_now" == "true" ]]; then
+    if ! systemctl restart "$SERVICE" || ! wait_ready; then
+      cp --preserve=mode,ownership,timestamps "$current_backup" "$CONFIG_FILE"
+      systemctl restart "$SERVICE" || true
+      wait_ready || true
+      die "Backup restore was rolled back because Crab-hole did not become ready"
+    fi
+  fi
+  restored_sha="$(config_sha)"
+  jq -n --arg restoredFrom "$backup_id" --arg safetyBackup "$current_backup" --arg sha256 "$restored_sha" \
+    --argjson appliedNow "$apply_now" '{restoredFrom:$restoredFrom,safetyBackup:$safetyBackup,sha256:$sha256,appliedNow:$appliedNow}'
+}
+
+service_action() {
+  local action="$1"
+  case "$action" in
+    start) systemctl start "$SERVICE"; wait_ready || die "Crab-hole did not become ready after start" ;;
+    restart) restart_service ;;
+    stop) systemctl stop "$SERVICE" ;;
+    *) die "Service action must be start, stop, or restart" ;;
+  esac
+  status
+}
+
+check_domain() {
+  local domain status_code a aaaa blocked=false
+  domain="$(normalize_domain "$1")"
+  validate_domain block "$domain"
+  status_code="$(dig @127.0.0.1 "$domain" A +noall +comments +time=3 +tries=1 | sed -n 's/.*status: \([^,]*\).*/\1/p' | head -n 1)"
+  a="$(dig @127.0.0.1 "$domain" A +short +time=3 +tries=1 || true)"
+  aaaa="$(dig @127.0.0.1 "$domain" AAAA +short +time=3 +tries=1 || true)"
+  if grep -qx '0.0.0.0' <<< "$a" || grep -qx '::' <<< "$aaaa"; then
+    blocked=true
+  fi
+  jq -n \
+    --arg domain "$domain" \
+    --arg status "${status_code:-UNKNOWN}" \
+    --argjson blocked "$blocked" \
+    --argjson a "$(jq -Rsc 'split("\n") | map(select(length > 0))' <<< "$a")" \
+    --argjson aaaa "$(jq -Rsc 'split("\n") | map(select(length > 0))' <<< "$aaaa")" \
+    '{domain:$domain,blocked:$blocked,status:$status,answers:{A:$a,AAAA:$aaaa}}'
+}
+
+list_rules() {
+  local kind="$1" limit="$2" file entries total
+  [[ "$limit" =~ ^[0-9]+$ && "$limit" -ge 1 && "$limit" -le 5000 ]] || die "Invalid limit"
+  file="$(rule_file "$kind")"
+  total="$(wc -l < "$file")"
+  entries="$(head -n "$limit" "$file" | jq -Rsc 'split("\n") | map(select(length > 0))')"
+  jq -n --arg kind "$kind" --argjson total "$total" --argjson entries "$entries" \
+    '{kind:$kind,total:$total,entries:$entries}'
+}
+
+list_blocklists() {
+  python3 - "$CONFIG_FILE" <<'PY'
+import json
+import sys
+import tomllib
+
+with open(sys.argv[1], "rb") as handle:
+    config = tomllib.load(handle)
+block = config.get("blocklist", {})
+print(json.dumps({
+    "blocklists": block.get("lists", []),
+    "allowLists": block.get("allow_list", []),
+    "includeSubdomains": block.get("include_subdomains", False),
+    "blockingMode": block.get("blocking_mode", "nxdomain"),
+}))
+PY
+}
+
+logs() {
+  local lines="$1" mode="$2" output
+  [[ "$lines" =~ ^[0-9]+$ && "$lines" -ge 1 && "$lines" -le 500 ]] || die "Invalid line count"
+  [[ "$mode" == "all" || "$mode" == "errors" ]] || die "Invalid log mode"
+  output="$(journalctl -u "$SERVICE" -n "$lines" --no-pager -o short-iso)"
+  if [[ "$mode" == "errors" ]]; then
+    output="$(grep -E '💥 ERROR| ERROR |failed|failure|irrecoverable' <<< "$output" || true)"
+  fi
+  jq -n --arg mode "$mode" --arg output "$output" '{mode:$mode,logs:$output}'
+}
+
+change_rule() {
+  local action="$1" kind="$2" domain="$3" apply_now="$4" file timestamp backup temp changed=false
+  domain="$(normalize_domain "$domain")"
+  validate_domain "$kind" "$domain"
+  [[ "$apply_now" == "true" || "$apply_now" == "false" ]] || die "applyNow must be true or false"
+  file="$(rule_file "$kind")"
+  exec 9>"$LOCK_FILE"
+  flock -x 9
+  backup="$(backup_file "$file")"
+  temp="$(mktemp "${file}.tmp.XXXXXX")"
+  trap 'rm -f -- "$temp"' EXIT
+  if [[ "$action" == "add" ]]; then
+    { cat "$file"; printf '%s\n' "$domain"; } | sed '/^[[:space:]]*$/d' | LC_ALL=C sort -u > "$temp"
+    if ! grep -Fxq "$domain" "$file"; then changed=true; fi
+  else
+    awk -v domain="$domain" '$0 != domain' "$file" > "$temp"
+    if grep -Fxq "$domain" "$file"; then changed=true; fi
+  fi
+  install -o root -g crabhole -m 0640 "$temp" "$file"
+  rm -f -- "$temp"
+  trap - EXIT
+  if [[ "$apply_now" == "true" && "$changed" == "true" ]]; then
+    if ! systemctl restart "$SERVICE" || ! wait_ready; then
+      cp "$backup" "$file"
+      systemctl restart "$SERVICE" || true
+      die "Rule change was rolled back because Crab-hole did not become ready"
+    fi
+  fi
+  jq -n --arg action "$action" --arg kind "$kind" --arg domain "$domain" \
+    --arg backup "$backup" --argjson changed "$changed" --argjson appliedNow "$apply_now" \
+    '{action:$action,kind:$kind,domain:$domain,changed:$changed,appliedNow:$appliedNow,backup:$backup}'
+}
+
+[[ $EUID -eq 0 ]] || die "This helper must run as root"
+command="${1:-}"
+shift || true
+case "$command" in
+  status) [[ $# -eq 0 ]] || die "status takes no arguments"; status ;;
+  get-config) [[ $# -eq 0 ]] || die "get-config takes no arguments"; get_config ;;
+  validate-current) [[ $# -eq 0 ]] || die "validate-current takes no arguments"; validate_current ;;
+  validate-proposed) [[ $# -eq 1 ]] || die "validate-proposed requires base64 config"; validate_proposed "$1" ;;
+  replace-config) [[ $# -eq 3 ]] || die "replace-config requires base64 config, expected hash, and applyNow"; replace_config "$1" "$2" "$3" ;;
+  list-backups) [[ $# -eq 1 ]] || die "list-backups requires limit"; list_backups "$1" ;;
+  restore-config) [[ $# -eq 2 ]] || die "restore-config requires backup id and applyNow"; restore_config "$1" "$2" ;;
+  service-action) [[ $# -eq 1 ]] || die "service-action requires action"; service_action "$1" ;;
+  check-domain) [[ $# -eq 1 ]] || die "check-domain requires a domain"; check_domain "$1" ;;
+  list-rules) [[ $# -eq 2 ]] || die "list-rules requires kind and limit"; list_rules "$1" "$2" ;;
+  list-blocklists) [[ $# -eq 0 ]] || die "list-blocklists takes no arguments"; list_blocklists ;;
+  logs) [[ $# -eq 2 ]] || die "logs requires line count and mode"; logs "$1" "$2" ;;
+  add-rule) [[ $# -eq 3 ]] || die "add-rule requires kind, domain, and applyNow"; change_rule add "$1" "$2" "$3" ;;
+  remove-rule) [[ $# -eq 3 ]] || die "remove-rule requires kind, domain, and applyNow"; change_rule remove "$1" "$2" "$3" ;;
+  restart) [[ $# -eq 0 ]] || die "restart takes no arguments"; service_action restart ;;
+  *) die "Unknown command" ;;
+esac
