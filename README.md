@@ -65,8 +65,10 @@ Service confirmations are exact: `START CRAB-HOLE`, `STOP CRAB-HOLE`, or
 
 ## Install
 
+See [SETUP.md](SETUP.md) for a full walkthrough. Quick version:
+
 ```bash
-git clone https://github.com/<your-fork>/crab-hole-mcp.git
+git clone https://github.com/papacasper/crab-hole-mcp.git
 cd crab-hole-mcp
 bun install
 bun run typecheck
